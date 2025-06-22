@@ -1,0 +1,44 @@
+Meeting Notes: RAG Agent Feature Brainstorm
+
+Date: June 20, 2024
+Attendees: AI Team
+
+Topic: Desired Features for the New LangGraph RAG Agent
+
+1. Core RAG Functionality:
+   - Must be able to ingest PDF and TXT files.
+   - Use 'all-MiniLM-L6-v2' for embeddings due to its balance of speed and quality.
+   - Vector store: ChromaDB for local persistence.
+
+2. Enhanced Retrieval Loop:
+   - Relevance Check: After retrieving documents, an LLM call (gpt-4o-mini) should assess if the documents are actually relevant to the user's query.
+     - Output: "yes" or "no".
+   - Query Rewriting: If documents are deemed not relevant (or not enough relevant documents are found), the agent should attempt to rewrite the original query.
+     - The rewritten query then goes back for another retrieval attempt.
+     - Limit rewrite attempts to 2-3 to avoid infinite loops.
+
+3. Generation Quality Control:
+   - Hallucination Check / Grounding: After an answer is generated, another LLM call to verify if the answer is factually supported by the provided context (retrieved documents).
+     - Output: "yes" or "no".
+     - If "no", the agent could try to re-generate with a stricter prompt or inform the user about potential lack of grounding.
+
+4. Conversational Context:
+   - The agent must remember previous turns of the conversation.
+   - User queries should be reformulated into standalone questions using chat history before retrieval. This is crucial for follow-up questions.
+
+5. User Interface:
+   - A simple Gradio chat interface is sufficient for demonstration.
+   - Should display the agent's responses clearly.
+
+6. Model Choice:
+   - Primary LLM for generation, grading, and rewriting: GPT-4o-mini.
+   - Justification: Good balance of capability and cost for this project scope.
+
+Action Items:
+- Dev Lead: Start with basic RAG pipeline (Day 1).
+- Team: Begin LangGraph integration (Day 2 onwards).
+- All: Prepare sample documents for testing. The project deadline is June 30th.
+
+Notes on LangGraph:
+- State object will be critical. Needs to hold: question, original_question, documents, relevance_grade, rewrite_attempts, generation, hallucination_grade, chat_history.
+- Conditional edges will drive the logic for rewriting and re-generation attempts.
