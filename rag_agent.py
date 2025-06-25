@@ -26,9 +26,11 @@ class AgentState(TypedDict):
     This dictionary will be passed between nodes in the graph.
     """
     question: str               # The input question from the user
+    original_question:str       # For referencing the original question
     documents: List[Document]   # List of retrieved documents
     generation: str             # The LLM-generated answer
-    relevance_grade: str         
+    relevance_grade: str       
+    rewrite_attempts:int    #how many times the question has been rewritten
 
 load_dotenv()
 
@@ -150,6 +152,61 @@ def grade_documents_node(state: AgentState) -> dict:
         print(f"Error during relevance grading: {e}")
         return {"relevance_grade": "no"} # Default to 'no' on error
     
+def transform_query_node(state: AgentState) -> dict:
+    """
+    Transforms the original query to improve retrieval results if initial documents were irrelevant.
+    Updates the 'question' field with the new query and increments 'rewrite_attempts'.
+    """
+    print("---NODE: TRANSFORM QUERY---")
+    original_question = state["original_question"] # Use the original question as base for rewriting
+    current_question = state["question"]           # The question that led to irrelevant docs
+    rewrite_attempts = state.get("rewrite_attempts", 0)
+
+    print(f"Original question: '{original_question}'")
+    print(f"Current (failed) question: '{current_question}'")
+    print(f"Rewrite attempt number: {rewrite_attempts + 1}")
+
+
+    transform_prompt_template = """You are a query rewriting expert.
+    The user's original question was: '{original_question}'
+    A previous search attempt using the question '{current_question}' did not yield relevant documents.
+    Your task is to rewrite the *original question* to be clearer, more specific, or to use different keywords
+    that might improve search results against a general knowledge base.
+    Do not just add "explain" or "tell me about". Try to rephrase substantively.
+    If you think the original question is already very good and cannot be improved, you can return the original question.
+
+    Original Question: {original_question}
+    Potentially Failed Question (for context, do not just slightly alter this): {current_question}
+
+    Rewritten Question:
+    """
+    transform_prompt = ChatPromptTemplate.from_template(transform_prompt_template)
+
+    # LLM call for transformation
+    # We can use the same global 'llm' instance.
+    transformer_chain = transform_prompt | llm | StrOutputParser()
+
+    try:
+        rewritten_question = transformer_chain.invoke({
+            "original_question": original_question,
+            "current_question": current_question
+        })
+        print(f"Rewritten question from LLM: '{rewritten_question.strip()}'")
+
+        # Update state with the new question and incremented attempt count
+        return {
+            "question": rewritten_question.strip(), # This now becomes the 'current' question for the next retrieval
+            "rewrite_attempts": rewrite_attempts + 1
+        }
+    except Exception as e:
+        print(f"Error during query transformation: {e}")
+        # If transformation fails, maybe we should just give up or revert to original?
+        # For now, let's just keep the current question and increment attempts to avoid infinite loop on error.
+        return {
+            "question": current_question, # Fallback to current question on error
+            "rewrite_attempts": rewrite_attempts + 1
+        }
+    
 def handle_irrelevance_node(state: AgentState) -> dict:
     """
     Handles the case where documents are deemed irrelevant.
@@ -209,9 +266,10 @@ workflow = StateGraph(AgentState)
 
 # Add nodes to the graph
 workflow.add_node("retrieve", retrieve_node)
-workflow.add_node("grade_documents", grade_documents_node) # New node
+workflow.add_node("grade_documents", grade_documents_node) 
+workflow.add_node("transform_query", transform_query_node)
 workflow.add_node("generate", generate_node)
-workflow.add_node("handle_irrelevance", handle_irrelevance_node) # New node
+workflow.add_node("handle_irrelevance", handle_irrelevance_node) 
 
 # Set the entry point
 workflow.set_entry_point("retrieve")
@@ -219,27 +277,38 @@ workflow.set_entry_point("retrieve")
 # Define edges and conditional logic
 workflow.add_edge("retrieve", "grade_documents") # retrieve -> grade_documents
 
-# The 'decide_to_generate_or_handle_irrelevance' function will determine the next node.
-def decide_to_generate_or_handle_irrelevance(state: AgentState) -> str:
+workflow.add_edge("transform_query", "retrieve") # This creates the loop
+
+# Conditional edge after 'grade_documents'
+MAX_REWRITE_ATTEMPTS = 2 # Define a maximum number of rewrite attempts
+
+def decide_next_step_after_grading(state: AgentState) -> str:
     """
-    Based on 'relevance_grade', decides the next step.
-    Returns the name of the next node to execute.
+    Based on 'relevance_grade' and 'rewrite_attempts', decides the next step.
     """
-    print("---CONDITIONAL EDGE: DECIDE GENERATE/IRRELEVANT---")
-    relevance_grade = state.get("relevance_grade", "no") # Default to "no" if not set
+    print("---CONDITIONAL EDGE: DECIDE AFTER GRADING---")
+    relevance_grade = state.get("relevance_grade", "no")
+    rewrite_attempts = state.get("rewrite_attempts", 0)
 
     if relevance_grade == "yes":
         print("Decision: Relevant documents found. Proceed to generate.")
-        return "generate"  # Name of the node to go to
-    else:
-        print("Decision: Documents are not relevant. Handle irrelevance.")
-        return "handle_irrelevance" # Name of the node to go to
+        return "generate"
+    else: # Documents are not relevant
+        print("Decision: Documents are NOT relevant.")
+        if rewrite_attempts < MAX_REWRITE_ATTEMPTS:
+            print(f"Rewrite attempts ({rewrite_attempts}) < max ({MAX_REWRITE_ATTEMPTS}). Proceed to transform query.")
+            return "transform_query"
+        else:
+            print(f"Max rewrite attempts ({MAX_REWRITE_ATTEMPTS}) reached. Handle irrelevance (cannot answer).")
+            return "handle_irrelevance"
+
 
 workflow.add_conditional_edges(
     "grade_documents",  # The node from which the conditional logic starts
-    decide_to_generate_or_handle_irrelevance, # The function that returns the next node's name
+    decide_next_step_after_grading,
     { # A dictionary mapping the condition's output to node names
         "generate": "generate",
+        "transform_query": "transform_query",
         "handle_irrelevance": "handle_irrelevance"
     }
 )
@@ -265,7 +334,7 @@ if __name__ == "__main__":
         if not user_query:
             continue
 
-        initial_state_input = {"question": user_query, "documents": [], "generation": "", "relevance_grade": "" } # Ensure all keys are present
+        initial_state_input = {"question": user_query, "original_question":user_query,"documents": [], "generation": "", "relevance_grade": "" ,"rewrite_attempts":0} # Ensure all keys are present
 
         print("Invoking RAG agent graph...")
         try:
