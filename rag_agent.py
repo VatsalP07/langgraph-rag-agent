@@ -18,6 +18,8 @@ CHROMA_PERSIST_DIRECTORY = "data/chroma_db"
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 OPENAI_MODEL_NAME = "gpt-4o-mini" 
 RELEVANCE_THRESHOLD = 0.5 
+MAX_REWRITE_ATTEMPTS = 2
+
 
 # --- LangGraph Agent State Definition ---
 class AgentState(TypedDict):
@@ -31,6 +33,7 @@ class AgentState(TypedDict):
     generation: str             # The LLM-generated answer
     relevance_grade: str       
     rewrite_attempts:int    #how many times the question has been rewritten
+    hallucination_grade: str 
 
 load_dotenv()
 
@@ -251,37 +254,6 @@ def generate_node(state: AgentState) -> dict:
 
     print(f"Generated answer: '{answer}'")
     return {"generation": answer} # Update the 'generation' field in the state
-
-
-
-
-from langgraph.graph import StateGraph, END
-
-# --- Define the LangGraph Workflow ---
-
-
-# --- Define the LangGraph Workflow ---
-print("Defining LangGraph workflow...")
-workflow = StateGraph(AgentState)
-
-# Add nodes to the graph
-workflow.add_node("retrieve", retrieve_node)
-workflow.add_node("grade_documents", grade_documents_node) 
-workflow.add_node("transform_query", transform_query_node)
-workflow.add_node("generate", generate_node)
-workflow.add_node("handle_irrelevance", handle_irrelevance_node) 
-
-# Set the entry point
-workflow.set_entry_point("retrieve")
-
-# Define edges and conditional logic
-workflow.add_edge("retrieve", "grade_documents") # retrieve -> grade_documents
-
-workflow.add_edge("transform_query", "retrieve") # This creates the loop
-
-# Conditional edge after 'grade_documents'
-MAX_REWRITE_ATTEMPTS = 2 # Define a maximum number of rewrite attempts
-
 def decide_next_step_after_grading(state: AgentState) -> str:
     """
     Based on 'relevance_grade' and 'rewrite_attempts', decides the next step.
@@ -301,27 +273,162 @@ def decide_next_step_after_grading(state: AgentState) -> str:
         else:
             print(f"Max rewrite attempts ({MAX_REWRITE_ATTEMPTS}) reached. Handle irrelevance (cannot answer).")
             return "handle_irrelevance"
+        
+def grade_generation_node(state: AgentState) -> dict:
+    """
+    Determines whether the generated answer is grounded in the provided documents
+    and addresses the original question.
+    Updates the 'hallucination_grade' field in the AgentState.
+    """
+    print("---NODE: GRADE GENERATION (HALLUCINATION/GROUNDEDNESS)---")
+    original_question = state["original_question"] # Check against the original intent
+    documents = state["documents"]
+    generation = state["generation"]
+
+    if not documents: # Should ideally not happen if relevance check passed, but as a safeguard
+        print("No documents provided for generation grading. Marking as not grounded.")
+        return {"hallucination_grade": "no"}
+    if not generation: # If generation failed or is empty
+         print("No generation to grade. Marking as not graded or error.")
+         return {"hallucination_grade": "no"} # Or a different status like 'not_graded'
+
+    formatted_docs = format_docs(documents)
+
+    # Grader prompt for hallucination/groundedness
+    hallucination_grader_prompt_template = """You are a grader assessing whether an answer is grounded in / supported by a set of retrieved documents.
+    Your goal is to determine if all claims in the answer can be directly verified from the provided documents.
+    The answer should also be relevant to the original user question.
+    Respond with 'yes' if the answer is well-grounded and relevant, and 'no' otherwise.
+    Do not provide any explanation or other text, just 'yes' or 'no'.
+
+    Retrieved Documents (Context):
+    {documents_context}
+
+    Original User Question:
+    {question}
+
+    Generated Answer:
+    {generation}
+
+    Is the Generated Answer grounded in the Context and relevant to the Question? (yes/no):
+    """
+    hallucination_grader_prompt = ChatPromptTemplate.from_template(hallucination_grader_prompt_template)
+
+    # LLM call for grading
+    grader_chain = hallucination_grader_prompt | llm | StrOutputParser()
+
+    print(f"Grading generation for question: '{original_question}'")
+    try:
+        grade_output = grader_chain.invoke({
+            "documents_context": formatted_docs,
+            "question": original_question, # Use original_question for relevance part of check
+            "generation": generation
+        })
+        grade = grade_output.strip().lower()
+        print(f"Groundedness grade from LLM: '{grade}'")
+
+        if "yes" in grade:
+            print("Groundedness Grade: YES (Answer is grounded and relevant)")
+            return {"hallucination_grade": "yes"}
+        elif "no" in grade:
+            print("Groundedness Grade: NO (Answer may not be grounded or relevant)")
+            return {"hallucination_grade": "no"}
+        else:
+            print(f"Warning: Unexpected grade format from hallucination grader: '{grade}'. Defaulting to 'no'.")
+            return {"hallucination_grade": "no"}
+
+    except Exception as e:
+        print(f"Error during generation grading: {e}")
+        return {"hallucination_grade": "no"} # Default to 'no' on error
+    
+
+def handle_hallucination_node(state: AgentState) -> dict:
+    """
+    Handles the case where the generation is deemed not grounded or hallucinatory.
+    Modifies the 'generation' to include a warning.
+    """
+    print("---NODE: HANDLE HALLUCINATION/UNGROUNDED ANSWER---")
+    original_generation = state["generation"]
+    warning_message = "[Warning: The following answer may not be fully supported by the provided documents or could be speculative.]\n"
+    updated_generation = warning_message + original_generation
+    return {"generation": updated_generation} # Overwrite the generation with the warning
 
 
+
+from langgraph.graph import StateGraph, END
+
+# --- Define the LangGraph Workflow ---
+
+
+print("Defining LangGraph workflow...")
+workflow = StateGraph(AgentState)
+
+# Add nodes to the graph
+workflow.add_node("retrieve", retrieve_node)
+workflow.add_node("grade_documents", grade_documents_node)
+workflow.add_node("transform_query", transform_query_node)
+workflow.add_node("generate", generate_node)
+workflow.add_node("grade_generation", grade_generation_node) # New node
+workflow.add_node("handle_irrelevance", handle_irrelevance_node)
+workflow.add_node("handle_hallucination", handle_hallucination_node) # New node
+
+
+# Set the entry point
+workflow.set_entry_point("retrieve")
+
+# Define edges and conditional logic
+
+workflow.add_edge("retrieve", "grade_documents")
+workflow.add_edge("transform_query", "retrieve") # Query rewrite loop
+
+# Conditional edge after 'grade_documents'
+# MAX_REWRITE_ATTEMPTS defined earlier (e.g., = 2)
 workflow.add_conditional_edges(
-    "grade_documents",  # The node from which the conditional logic starts
-    decide_next_step_after_grading,
-    { # A dictionary mapping the condition's output to node names
+    start_node_name="grade_documents",
+    condition=decide_next_step_after_grading, # This function was defined on Day 4
+    conditional_edge_mapping={
         "generate": "generate",
         "transform_query": "transform_query",
         "handle_irrelevance": "handle_irrelevance"
     }
 )
 
-# Edges to END
-workflow.add_edge("generate", END) # If generation happens, then end.
-workflow.add_edge("handle_irrelevance", END) # If irrelevance is handled, then end.
+# After generation, always grade the generation
+workflow.add_edge("generate", "grade_generation")
+
+# Conditional edge after 'grade_generation'
+def decide_after_generation_grading(state: AgentState) -> str:
+    """
+    Based on 'hallucination_grade', decides if the answer is final or needs handling.
+    """
+    print("---CONDITIONAL EDGE: DECIDE AFTER GENERATION GRADING---")
+    hallucination_grade = state.get("hallucination_grade", "no") # Default to "no"
+
+    if hallucination_grade == "yes":
+        print("Decision: Generation is grounded. Proceed to END.")
+        return "END_SUCCESS" # Using a more descriptive name for the branch
+    else:
+        print("Decision: Generation may not be grounded. Handle hallucination.")
+        return "handle_hallucination"
+
+workflow.add_conditional_edges(
+    start_node_name="grade_generation",
+    condition=decide_after_generation_grading,
+    conditional_edge_mapping={
+        "END_SUCCESS": END, # If grounded, go straight to END
+        "handle_hallucination": "handle_hallucination"
+    }
+)
+
+# Final Edges to END
+workflow.add_edge("handle_hallucination", END) # After handling hallucination, end.
+workflow.add_edge("handle_irrelevance", END)   # If cannot answer, end.
+
 
 # Compile the graph
 print("Compiling LangGraph...")
 app = workflow.compile()
 print("LangGraph compiled successfully.")
-
 
 if __name__ == "__main__":
     print("\n--- Running RAG Agent (LangGraph) ---")
@@ -334,7 +441,7 @@ if __name__ == "__main__":
         if not user_query:
             continue
 
-        initial_state_input = {"question": user_query, "original_question":user_query,"documents": [], "generation": "", "relevance_grade": "" ,"rewrite_attempts":0} # Ensure all keys are present
+        initial_state_input = {"question": user_query, "original_question":user_query,"documents": [], "generation": "", "relevance_grade": "" ,"rewrite_attempts":0,"hallucination_grade":""} # Ensure all keys are present
 
         print("Invoking RAG agent graph...")
         try:
