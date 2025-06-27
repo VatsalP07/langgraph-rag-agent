@@ -8,10 +8,13 @@ import operator # For chat history
 from langchain_openai import ChatOpenAI
 from langchain_huggingface import HuggingFaceEmbeddings # Updated line
 from langchain_chroma import Chroma                     # Updated line
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough 
 from langchain_core.documents import Document 
+from typing import List, TypedDict, Annotated, Sequence # Annotated & Sequence are new
+from langchain_core.messages import BaseMessage # BaseMessage is new
+import operator # operator is new
 
 # --- Configuration (Copied and adapted from simple_rag.py) ---
 CHROMA_PERSIST_DIRECTORY = "data/chroma_db"
@@ -34,6 +37,7 @@ class AgentState(TypedDict):
     relevance_grade: str       
     rewrite_attempts:int    #how many times the question has been rewritten
     hallucination_grade: str 
+    chat_history: Annotated[Sequence[BaseMessage], operator.add]
 
 load_dotenv()
 
@@ -52,25 +56,77 @@ llm = ChatOpenAI(
     openai_api_key=os.getenv("OPENAI_API_KEY")
 )
 
-RAG_PROMPT_TEMPLATE = """You are an assistant for question-answering tasks.
+# RAG_PROMPT_TEMPLATE = """...""" # This was the old one
+
+# New prompt that includes chat history
+RAG_PROMPT_TEMPLATE = ChatPromptTemplate.from_messages([
+    ("system", """You are an assistant for question-answering tasks.
 Use the following pieces of retrieved context to answer the question.
 If you don't know the answer, just say that you don't know.
 Keep the answer concise.
 
 Context:
-{context}
+{context}"""),
+    MessagesPlaceholder(variable_name="chat_history"),
+    ("human", "{question}"),
+])
 
-Question:
-{question}
-
-Answer:
-"""
-rag_prompt = ChatPromptTemplate.from_template(RAG_PROMPT_TEMPLATE)
-
+# Rename the variable for clarity
+rag_prompt_with_history = RAG_PROMPT_TEMPLATE
 
 def format_docs(docs: List[Document]) -> str:
     """Helper function to format retrieved documents into a single string."""
     return "\n\n".join(doc.page_content for doc in docs)
+from langchain_core.prompts import MessagesPlaceholder
+
+# NODES IN THE GRAPH
+
+
+def condense_question_node(state: AgentState) -> dict:
+    """
+    Condenses the chat history and new question into a single, standalone question.
+    Updates the 'question' field in the state, which will be used for retrieval.
+    """
+    print("---NODE: CONDENSE QUESTION---")
+    # Get the history and the new question
+    chat_history = state["chat_history"]
+    question = state["question"]
+
+    # If there's no history, the question is already standalone.
+    if not chat_history:
+        print("No chat history, using question as is.")
+        return {"question": question}
+
+    # Prompt for condensing the question
+    condense_prompt_template = """Given the following conversation and a follow up question, rephrase the
+    follow up question to be a standalone question, in its original language.
+
+    Chat History:
+    {chat_history}
+
+    Follow Up Input: {question}
+    Standalone question:"""
+    condense_prompt = ChatPromptTemplate.from_messages([
+        ("system", condense_prompt_template),
+        # MessagesPlaceholder is a special prompt component that formats a list of BaseMessages
+        MessagesPlaceholder(variable_name="chat_history"),
+        ("human", "{question}")
+    ])
+
+    # Condenser chain
+    condenser_chain = condense_prompt | llm | StrOutputParser()
+
+    print("Condensing question with chat history...")
+    try:
+        condensed_question = condenser_chain.invoke({
+            "chat_history": chat_history,
+            "question": question
+        })
+        print(f"Condensed question: '{condensed_question.strip()}'")
+        return {"question": condensed_question.strip()}
+    except Exception as e:
+        print(f"Error during question condensing: {e}. Using original question as fallback.")
+        return {"question": question} # Fallback to original question on error
 
 def retrieve_node(state: AgentState) -> dict:
     """
@@ -228,6 +284,7 @@ def generate_node(state: AgentState) -> dict:
     print("---NODE: GENERATE ANSWER---")
     question = state["question"]
     documents = state["documents"] # Documents are now List[Document]
+    chat_history = state["chat_history"] # Get chat history from state
 
     if not documents:
         print("No documents found to generate an answer.")
@@ -244,16 +301,19 @@ def generate_node(state: AgentState) -> dict:
     # Create the RAG chain for this specific invocation
     # (prompt | llm | parser)
     # We could also define this chain globally if it doesn't change
-    generation_chain = rag_prompt | llm | StrOutputParser()
+    generation_chain = rag_prompt_with_history | llm | StrOutputParser()
 
     # Invoke the chain
     answer = generation_chain.invoke({
         "context": formatted_context,
-        "question": question
+        "question": question,
+        "chat_history": chat_history # Pass the history here
     })
 
     print(f"Generated answer: '{answer}'")
     return {"generation": answer} # Update the 'generation' field in the state
+
+
 def decide_next_step_after_grading(state: AgentState) -> str:
     """
     Based on 'relevance_grade' and 'rewrite_attempts', decides the next step.
@@ -355,6 +415,11 @@ def handle_hallucination_node(state: AgentState) -> dict:
 
 
 
+
+
+
+
+
 from langgraph.graph import StateGraph, END
 
 # --- Define the LangGraph Workflow ---
@@ -364,6 +429,7 @@ print("Defining LangGraph workflow...")
 workflow = StateGraph(AgentState)
 
 # Add nodes to the graph
+workflow.add_node("condense_question", condense_question_node) # New node
 workflow.add_node("retrieve", retrieve_node)
 workflow.add_node("grade_documents", grade_documents_node)
 workflow.add_node("transform_query", transform_query_node)
@@ -374,19 +440,18 @@ workflow.add_node("handle_hallucination", handle_hallucination_node) # New node
 
 
 # Set the entry point
-workflow.set_entry_point("retrieve")
-
+workflow.set_entry_point("condense_question")
 # Define edges and conditional logic
-
+workflow.add_edge("condense_question", "retrieve")
 workflow.add_edge("retrieve", "grade_documents")
 workflow.add_edge("transform_query", "retrieve") # Query rewrite loop
 
 # Conditional edge after 'grade_documents'
 # MAX_REWRITE_ATTEMPTS defined earlier (e.g., = 2)
 workflow.add_conditional_edges(
-    start_node_name="grade_documents",
-    condition=decide_next_step_after_grading, # This function was defined on Day 4
-    conditional_edge_mapping={
+    "grade_documents",
+    decide_next_step_after_grading, # This function was defined on Day 4
+    {
         "generate": "generate",
         "transform_query": "transform_query",
         "handle_irrelevance": "handle_irrelevance"
@@ -412,9 +477,9 @@ def decide_after_generation_grading(state: AgentState) -> str:
         return "handle_hallucination"
 
 workflow.add_conditional_edges(
-    start_node_name="grade_generation",
-    condition=decide_after_generation_grading,
-    conditional_edge_mapping={
+    "grade_generation",
+    decide_after_generation_grading,
+    {
         "END_SUCCESS": END, # If grounded, go straight to END
         "handle_hallucination": "handle_hallucination"
     }
@@ -434,6 +499,11 @@ if __name__ == "__main__":
     print("\n--- Running RAG Agent (LangGraph) ---")
     print("Type 'exit' or 'quit' to stop.")
 
+    from langchain_core.messages import HumanMessage, AIMessage
+
+    # Keep track of chat history for the session
+    session_history = []
+
     while True:
         user_query = input("\nAsk a question: ")
         if user_query.lower() in ["exit", "quit"]:
@@ -441,15 +511,18 @@ if __name__ == "__main__":
         if not user_query:
             continue
 
-        initial_state_input = {"question": user_query, "original_question":user_query,"documents": [], "generation": "", "relevance_grade": "" ,"rewrite_attempts":0,"hallucination_grade":""} # Ensure all keys are present
+        initial_state_input = {"question": user_query, "original_question":user_query, "chat_history": session_history, "documents": [], "generation": "", "relevance_grade": "" ,"rewrite_attempts":0,"hallucination_grade":""} # Ensure all keys are present
 
         print("Invoking RAG agent graph...")
         try:
             final_state = app.invoke(initial_state_input)
 
             print("\n--- Agent Response ---")
-            print(final_state.get("generation", "No generation found."))
-
+            final_generation = final_state.get("generation", "No generation found.")
+            print(final_generation)
+              # Update the session history for the next turn
+            session_history.append(HumanMessage(content=user_query))
+            session_history.append(AIMessage(content=final_generation))
         except Exception as e:
             print(f"An error occurred while running the agent: {e}")
             import traceback
