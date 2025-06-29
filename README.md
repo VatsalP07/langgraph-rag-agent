@@ -17,7 +17,7 @@ This project is a sophisticated, conversational RAG (Retrieval-Augmented Generat
 
 ## Architecture & Flow
 
-The agent's logic is structured as a state machine using LangGraph. The diagram below illustrates the conditional paths and loops that make the agent robust. It's not a simple linear chain; it's a graph that can reason about its own progress.
+The agent's logic is structured as a state machine using LangGraph. The diagram below illustrates the conditional paths and loops that make the agent robust. It's not a simple linear chain; it's a graph that can reason about its own progress and attempt to recover from failures.
 
 ```mermaid
 graph TD
@@ -34,13 +34,3 @@ graph TD
     I -- Not Grounded --> K(handle_hallucination_node);
     K --> J;
     H --> J;
-
-
-
-Technology Stack
-Orchestration: LangChain & LangGraph
-LLM: OpenAI gpt-4o-mini
-Embeddings: Hugging Face sentence-transformers (all-MiniLM-L6-v2)
-Vector Store: ChromaDB
-UI: Gradio
-Document Loading: PyPDF, Unstructured
