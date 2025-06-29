@@ -34,3 +34,13 @@ graph TD
     I -- Not Grounded --> K(handle_hallucination_node);
     K --> J;
     H --> J;
+
+
+
+Technology Stack
+Orchestration: LangChain & LangGraph
+LLM: OpenAI gpt-4o-mini
+Embeddings: Hugging Face sentence-transformers (all-MiniLM-L6-v2)
+Vector Store: ChromaDB
+UI: Gradio
+Document Loading: PyPDF, Unstructured
