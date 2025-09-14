@@ -317,6 +317,7 @@ workflow.add_conditional_edges(
 workflow.add_edge("handle_hallucination", END)
 workflow.add_edge("handle_irrelevance", END)
 
+
 logger.info("Compiling LangGraph...")
 app = workflow.compile()
 logger.info("LangGraph compiled successfully.")
