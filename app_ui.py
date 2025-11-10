@@ -65,7 +65,7 @@ if __name__ == "__main__":
     # Create the Gradio ChatInterface
     chat_ui = gr.ChatInterface(
         fn=agent_chat_interface,
-        title="Resume RAG Agent",
+        title="RAG Agent",
         description="Ask me questions about the provided documents. I can check for relevance, rewrite queries, check my own answers, and remember our conversation.",
         examples=[
             ["What is LangGraph?"],

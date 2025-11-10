@@ -8,7 +8,6 @@ __pycache__/
 # Environment files
 .env
 
-data/chroma_db/
 
 # VS Code
 .vscode/
